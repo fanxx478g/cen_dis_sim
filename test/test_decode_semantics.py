@@ -70,6 +70,10 @@ class DecodeSemanticsTest(unittest.TestCase):
         self.assertEqual(summary["decode_batch_executions"], 1023)
         self.assertEqual(summary["decode_batch_size_max"], 1)
         self.assertEqual(pool_stats["edge-decode"]["total_enqueued_requests"], 1)
+        self.assertEqual(
+            pool_stats["edge-decode"]["total_dispatched_requests"],
+            summary["decode_batch_executions"],
+        )
         self.assertEqual(pool_stats["edge-decode"]["resident_count_final"], 0)
 
 

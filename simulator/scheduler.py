@@ -36,6 +36,15 @@ class Scheduler:
         *,
         is_first_decode: bool,
     ) -> ResourcePool:
+        if (
+            not is_first_decode
+            and not self.config.scheduler.allow_following_decode_cross_cluster
+            and request.target_decode_pool_id is not None
+        ):
+            for pool in candidate_pools:
+                if pool.pool_id == request.target_decode_pool_id:
+                    return pool
+
         eligible = candidate_pools
         eligible = self._eligible_decode_pools(
             request,

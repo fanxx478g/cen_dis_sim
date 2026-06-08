@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import heapq
+import itertools
 import logging
 import random
 
@@ -178,9 +179,12 @@ class SimulationEngine:
                     self.metrics.max_prefill_batch_size, len(batch.request_ids)
                 )
             else:
+                decode_step_count = max(batch.token_step_count, 1)
                 finished_request_ids.extend(self._finish_decode_batch(batch))
-                self.metrics.total_decode_batches += 1
-                self.metrics.total_decode_batch_requests += len(batch.request_ids)
+                self.metrics.total_decode_batches += decode_step_count
+                self.metrics.total_decode_batch_requests += (
+                    len(batch.request_ids) * decode_step_count
+                )
                 self.metrics.max_decode_batch_size = max(
                     self.metrics.max_decode_batch_size, len(batch.request_ids)
                 )
@@ -273,11 +277,12 @@ class SimulationEngine:
         rerouted_by_pool: dict[str, list[int]] = {}
         cross_cluster_by_pool: dict[str, int] = {}
         pool.clear_inflight_requests(batch.request_ids)
+        decode_step_count = max(batch.token_step_count, 1)
 
         for request_id in batch.request_ids:
             request = self.requests[request_id]
-            request.generated_tokens += 1
-            request.decode_step_count += 1
+            request.generated_tokens += decode_step_count
+            request.decode_step_count += decode_step_count
             if request.generated_tokens >= request.output_tokens:
                 request.stage = RequestStage.FINISHED
                 request.finish_time_ms = batch.finish_time_ms
@@ -459,10 +464,18 @@ class SimulationEngine:
         if not batch_request_ids:
             return None
 
-        pool.total_dispatched_requests += len(batch_request_ids)
-        finish_time_ms = self.current_time_ms + self._estimate_batch_duration_ms(
-            pool.kind, batch_request_ids
-        )
+        batch_duration_ms = self._estimate_batch_duration_ms(pool.kind, batch_request_ids)
+        token_step_count = 1
+        if pool.kind == ResourceKind.DECODE:
+            token_step_count = self._merged_decode_step_count(
+                pool,
+                batch_request_ids,
+                batch_duration_ms,
+            )
+            pool.total_dispatched_requests += len(batch_request_ids) * token_step_count
+        else:
+            pool.total_dispatched_requests += len(batch_request_ids)
+        finish_time_ms = self.current_time_ms + (batch_duration_ms * token_step_count)
         batch = TaskBatch(
             batch_id=self.next_batch_id,
             kind=pool.kind,
@@ -471,7 +484,7 @@ class SimulationEngine:
             finish_time_ms=finish_time_ms,
             cluster_id=pool.cluster_id,
             pool_id=pool.pool_id,
-            token_step_count=1 if pool.kind == ResourceKind.DECODE else 0,
+            token_step_count=token_step_count if pool.kind == ResourceKind.DECODE else 0,
         )
         if pool.kind == ResourceKind.DECODE:
             if self.debug_logging_enabled:
@@ -513,6 +526,188 @@ class SimulationEngine:
         if pool.runnable_decode_request_count() <= 0:
             return []
         return pool.pop_runnable_decode_request_ids(pool.max_batch_size)
+
+    def _merged_decode_step_count(
+        self,
+        pool: ResourcePool,
+        batch_request_ids: list[int],
+        single_step_duration_ms: float,
+    ) -> int:
+        if self.config.scheduler.allow_following_decode_cross_cluster:
+            return 1
+        if len(pool.instances) != 1:
+            return 1
+        if pool.waiting_request_ids:
+            return 1
+        if single_step_duration_ms <= 0:
+            return 1
+
+        earliest_external_event_time_ms = self._earliest_relevant_decode_interrupt_time_ms(
+            pool
+        )
+        if earliest_external_event_time_ms is not None:
+            safe_window_ms = earliest_external_event_time_ms - self.current_time_ms
+            if safe_window_ms < single_step_duration_ms:
+                return 1
+            safe_steps_before_external_event = int(
+                safe_window_ms // single_step_duration_ms
+            )
+        else:
+            safe_steps_before_external_event = 0
+
+        remaining_decode_steps = min(
+            max(self.requests[request_id].output_tokens - self.requests[request_id].generated_tokens, 0)
+            for request_id in batch_request_ids
+        )
+        if remaining_decode_steps <= 1:
+            return 1
+
+        if earliest_external_event_time_ms is None:
+            return remaining_decode_steps
+        return max(1, min(remaining_decode_steps, safe_steps_before_external_event))
+
+    def _earliest_relevant_decode_interrupt_time_ms(
+        self, decode_pool: ResourcePool
+    ) -> float | None:
+        next_relevant_prefill_finish_time_ms = (
+            self._earliest_relevant_prefill_finish_time_ms(decode_pool)
+        )
+        next_arrival_prefill_finish_time_ms = (
+            self._earliest_prefill_completion_after_next_arrival_ms(decode_pool)
+        )
+
+        if next_relevant_prefill_finish_time_ms is None:
+            return next_arrival_prefill_finish_time_ms
+        if next_arrival_prefill_finish_time_ms is None:
+            return next_relevant_prefill_finish_time_ms
+        return min(
+            next_relevant_prefill_finish_time_ms,
+            next_arrival_prefill_finish_time_ms,
+        )
+
+    def _earliest_relevant_prefill_finish_time_ms(
+        self, decode_pool: ResourcePool
+    ) -> float | None:
+        earliest_finish_time_ms: float | None = None
+        for batch in self.batches.values():
+            if batch.kind not in (ResourceKind.LONG_PREFILL, ResourceKind.SHORT_PREFILL):
+                continue
+            if not self._prefill_batch_can_feed_decode_pool(batch, decode_pool):
+                continue
+            if (
+                earliest_finish_time_ms is None
+                or batch.finish_time_ms < earliest_finish_time_ms
+            ):
+                earliest_finish_time_ms = batch.finish_time_ms
+
+        immediate_dispatch_finish_time_ms = (
+            self._earliest_dispatchable_prefill_finish_time_ms(decode_pool)
+        )
+        if earliest_finish_time_ms is None:
+            return immediate_dispatch_finish_time_ms
+        if immediate_dispatch_finish_time_ms is None:
+            return earliest_finish_time_ms
+        return min(earliest_finish_time_ms, immediate_dispatch_finish_time_ms)
+
+    def _earliest_dispatchable_prefill_finish_time_ms(
+        self, decode_pool: ResourcePool
+    ) -> float | None:
+        earliest_finish_time_ms: float | None = None
+        for prefill_pool in self._relevant_prefill_pools_for_decode_pool(decode_pool):
+            idle_instance_count = prefill_pool.idle_instance_count()
+            if idle_instance_count <= 0 or not prefill_pool.waiting_request_ids:
+                continue
+
+            waiting_iterator = iter(prefill_pool.waiting_request_ids)
+            immediate_batch_count = idle_instance_count
+            for _ in range(immediate_batch_count):
+                batch_request_ids = list(
+                    itertools.islice(waiting_iterator, prefill_pool.max_batch_size)
+                )
+                if not batch_request_ids:
+                    break
+                batch_duration_ms = self._estimate_batch_duration_ms(
+                    prefill_pool.kind,
+                    batch_request_ids,
+                )
+                finish_time_ms = self.current_time_ms + batch_duration_ms
+                if (
+                    earliest_finish_time_ms is None
+                    or finish_time_ms < earliest_finish_time_ms
+                ):
+                    earliest_finish_time_ms = finish_time_ms
+        return earliest_finish_time_ms
+
+    def _earliest_prefill_completion_after_next_arrival_ms(
+        self, decode_pool: ResourcePool
+    ) -> float | None:
+        next_arrival_time_ms = self.request_generator.next_arrival_time_ms()
+        if next_arrival_time_ms is None:
+            return None
+
+        earliest_finish_time_ms: float | None = None
+        for kind in self._possible_prefill_kinds():
+            for prefill_pool in self._relevant_prefill_pools_for_decode_pool(
+                decode_pool,
+                kind=kind,
+            ):
+                finish_time_ms = (
+                    next_arrival_time_ms + self._minimum_prefill_duration_ms(kind)
+                )
+                if (
+                    earliest_finish_time_ms is None
+                    or finish_time_ms < earliest_finish_time_ms
+                ):
+                    earliest_finish_time_ms = finish_time_ms
+        return earliest_finish_time_ms
+
+    def _relevant_prefill_pools_for_decode_pool(
+        self,
+        decode_pool: ResourcePool,
+        *,
+        kind: ResourceKind | None = None,
+    ) -> list[ResourcePool]:
+        if kind is None:
+            pools = (
+                self.prefill_pools_by_kind[ResourceKind.SHORT_PREFILL]
+                + self.prefill_pools_by_kind[ResourceKind.LONG_PREFILL]
+            )
+        else:
+            pools = self.prefill_pools_by_kind[kind]
+
+        if self.config.scheduler.allow_first_decode_cross_cluster:
+            return pools
+        return [pool for pool in pools if pool.cluster_id == decode_pool.cluster_id]
+
+    def _prefill_batch_can_feed_decode_pool(
+        self, batch: TaskBatch, decode_pool: ResourcePool
+    ) -> bool:
+        if self.config.scheduler.allow_first_decode_cross_cluster:
+            return True
+        return batch.cluster_id == decode_pool.cluster_id
+
+    def _possible_prefill_kinds(self) -> tuple[ResourceKind, ...]:
+        cfg = self.config.request_generation
+        kinds: list[ResourceKind] = []
+        if cfg.short_context_probability > 0.0:
+            kinds.append(ResourceKind.SHORT_PREFILL)
+        if cfg.short_context_probability < 1.0:
+            kinds.append(ResourceKind.LONG_PREFILL)
+        return tuple(kinds)
+
+    def _minimum_prefill_duration_ms(self, kind: ResourceKind) -> float:
+        cfg = self.config.request_generation
+        if kind == ResourceKind.LONG_PREFILL:
+            base_tokens = cfg.long_context_prompt_tokens
+            variation_ratio = cfg.initial_prompt_variation_ratio
+            coeff = self.config.performance.long_prefill_ms_per_token
+        else:
+            base_tokens = cfg.short_context_prompt_tokens
+            variation_ratio = cfg.initial_prompt_variation_ratio
+            coeff = self.config.performance.short_prefill_ms_per_token
+
+        min_tokens = max(1, int(round(base_tokens * (1.0 - variation_ratio))))
+        return min_tokens * coeff
 
     def _remove_from_resident(self, pool: ResourcePool, completed_ids: set[int]) -> None:
         if not completed_ids:

@@ -56,7 +56,7 @@ def build_distributed_10_cluster_config() -> SimulationConfig:
             user_count=10 * 60,
             min_turns_per_user=1,
             max_turns_per_user=10,
-            new_user_arrival_mean_seconds=0.01,
+            new_user_arrival_mean_seconds=0.05,
             followup_arrival_mean_seconds=30,
             followup_arrival_std_seconds=5,
             accumulate_context_across_turns=False,
