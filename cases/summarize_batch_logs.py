@@ -63,6 +63,13 @@ def main() -> None:
                 "prefill_first_token_latency_max_ms": rows[0].get(
                     "prefill_first_token_latency_max_ms"
                 ),
+                "short_prefill_utilization": rows[0].get(
+                    "short_prefill_utilization"
+                ),
+                "long_prefill_utilization": rows[0].get(
+                    "long_prefill_utilization"
+                ),
+                "decode_utilization": rows[0].get("decode_utilization"),
                 "log_file_name": rows[0].get("log_file_name"),
             },
             sort_dicts=False,

@@ -153,6 +153,12 @@ def run_config_with_file_logging(
         engine = SimulationEngine(config=config, seed=seed)
         metrics = engine.run()
         summary = metrics.summary()
+        summary.update(
+            metrics.global_summary(
+                pools=engine.pools,
+                total_time_ms=engine.current_time_ms,
+            )
+        )
         elapsed_seconds = time.time() - started
         append_summary_to_log(
             log_file_path,
@@ -181,6 +187,25 @@ def _parse_scalar(text: str) -> object:
         return int(text)
     except ValueError:
         return text
+
+
+def _parse_global_summary_log_line(content: str) -> dict[str, object]:
+    parsed: dict[str, object] = {}
+    summary_line: str | None = None
+    for line in content.splitlines():
+        if "global_summary " in line:
+            summary_line = line.strip()
+    if summary_line is None:
+        return parsed
+
+    payload = summary_line.split("global_summary ", 1)[1].strip()
+    for item in payload.split(","):
+        part = item.strip()
+        if not part or "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        parsed[key.strip()] = _parse_scalar(value)
+    return parsed
 
 
 def parse_batch_log(log_file_path: str) -> dict[str, object] | None:
@@ -225,6 +250,10 @@ def parse_batch_log(log_file_path: str) -> dict[str, object] | None:
     elapsed_line = content[elapsed_marker:].splitlines()[0].strip()
 
     summary = ast.literal_eval(summary_block)
+    log_line_summary = _parse_global_summary_log_line(content)
+    for key, value in log_line_summary.items():
+        if key not in summary or summary[key] is None:
+            summary[key] = value
     elapsed_text = elapsed_line.replace("===仿真时间===", "").strip()
     if elapsed_text.endswith("s"):
         elapsed_text = elapsed_text[:-1].strip()
@@ -293,9 +322,18 @@ def export_batch_log_summary_csv(
         "requests_with_prefill_first_token_latency_le_2s",
         "requests_with_prefill_first_token_latency_le_2s_ratio",
     ]
+    utilization_columns = [
+        "short_prefill_utilization",
+        "long_prefill_utilization",
+        "decode_utilization",
+    ]
 
     prioritized_columns = (
-        parameter_columns + throughput_columns + tpot_columns + ttft_columns
+        parameter_columns
+        + throughput_columns
+        + tpot_columns
+        + ttft_columns
+        + utilization_columns
     )
     percentile_suffix_tokens = ("_p50_", "_p95_", "_p99_")
     excluded_columns = {
