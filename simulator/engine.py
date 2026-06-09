@@ -73,7 +73,10 @@ class SimulationEngine:
         self._drain_system()
         self._finalize_pool_queue_stats()
         self.metrics.request_records = list(self.requests.values())
-        global_summary = self.metrics.global_summary()
+        global_summary = self.metrics.global_summary(
+            pools=self.pools,
+            total_time_ms=self.current_time_ms,
+        )
         if self.critical_logging_enabled:
             self._log(
                 logging.CRITICAL,
@@ -365,6 +368,7 @@ class SimulationEngine:
             request, self.prefill_pools_by_kind[prefill_kind]
         )
         request.target_prefill_pool_id = prefill_pool.pool_id
+        request.target_prefill_kind = prefill_kind
         request.stage = RequestStage.PREFILL_WAITING
         request.last_enqueue_time_ms = self.current_time_ms
         self._enqueue_requests(

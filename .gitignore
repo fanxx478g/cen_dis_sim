@@ -9,5 +9,7 @@ __pycache__/
 venv/
 env/
 
+cases/log/
+
 .DS_Store
 Thumbs.db

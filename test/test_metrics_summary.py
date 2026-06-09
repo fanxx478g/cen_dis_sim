@@ -81,6 +81,16 @@ class MetricsSummaryTest(unittest.TestCase):
         total_decode_tokens = sum(max(request.output_tokens - 1, 0) for request in completed)
         total_prompt_tokens = sum(request.prompt_tokens for request in completed)
         prefill_queue_values = [request.queue_time_prefill_ms for request in completed]
+        short_prefill_requests = [
+            request
+            for request in metrics.request_records
+            if request.target_prefill_kind == ResourceKind.SHORT_PREFILL
+        ]
+        long_prefill_requests = [
+            request
+            for request in metrics.request_records
+            if request.target_prefill_kind == ResourceKind.LONG_PREFILL
+        ]
 
         self.assertIn("prefill_first_token_latency_p50_ms", summary)
         self.assertIn("system_tpot_avg_ms", summary)
@@ -96,6 +106,10 @@ class MetricsSummaryTest(unittest.TestCase):
             sum(request_tpot_values) / len(request_tpot_values),
         )
         self.assertAlmostEqual(summary["active_window_ms"] or 0.0, active_window_ms)
+        self.assertAlmostEqual(
+            summary["simulation_total_time_ms"] or 0.0,
+            max(request.finish_time_ms or 0.0 for request in completed),
+        )
         self.assertAlmostEqual(
             summary["request_throughput_rps"] or 0.0,
             len(completed) / active_window_s,
@@ -121,13 +135,42 @@ class MetricsSummaryTest(unittest.TestCase):
             max(prefill_queue_values),
         )
         self.assertEqual(
-            summary["req_queued_count"],
+            summary["prefill_queued_count"],
             sum(1 for value in prefill_queue_values if value > 0.0),
         )
         self.assertAlmostEqual(
-            summary["req_queued_ratio"] or 0.0,
-            sum(1 for value in prefill_queue_values if value > 0.0) / len(completed),
+            summary["prefill_queued_ratio"] or 0.0,
+            sum(1 for value in prefill_queue_values if value > 0.0)
+            / len(metrics.request_records),
         )
+        self.assertEqual(summary["req_queued_count"], summary["prefill_queued_count"])
+        self.assertEqual(summary["req_queued_ratio"], summary["prefill_queued_ratio"])
+        self.assertEqual(
+            summary["short_prefill_queued_count"],
+            sum(1 for request in short_prefill_requests if request.queue_time_prefill_ms > 0.0),
+        )
+        self.assertAlmostEqual(
+            summary["short_prefill_queued_ratio"] or 0.0,
+            sum(1 for request in short_prefill_requests if request.queue_time_prefill_ms > 0.0)
+            / len(short_prefill_requests),
+        )
+        if long_prefill_requests:
+            self.assertEqual(
+                summary["long_prefill_queued_count"],
+                sum(
+                    1 for request in long_prefill_requests if request.queue_time_prefill_ms > 0.0
+                ),
+            )
+            self.assertAlmostEqual(
+                summary["long_prefill_queued_ratio"] or 0.0,
+                sum(
+                    1 for request in long_prefill_requests if request.queue_time_prefill_ms > 0.0
+                )
+                / len(long_prefill_requests),
+            )
+        else:
+            self.assertIsNone(summary["long_prefill_queued_ratio"])
+            self.assertEqual(summary["long_prefill_queued_count"], 0)
         self.assertEqual(
             summary["requests_with_tpot_le_50ms"],
             sum(1 for value in request_tpot_values if value is not None and value <= 50.0),
@@ -165,6 +208,7 @@ class MetricsSummaryTest(unittest.TestCase):
         self.assertIn("ttft_ms", request_rows[0])
         self.assertIn("prefill_first_token_latency_ms", request_rows[0])
         self.assertIn("request_tpot_ms", request_rows[0])
+        self.assertIn("prefill_kind", request_rows[0])
         self.assertEqual(
             request_rows[0]["ttft_ms"],
             request_rows[0]["prefill_first_token_latency_ms"],
@@ -174,7 +218,10 @@ class MetricsSummaryTest(unittest.TestCase):
         engine = SimulationEngine(config=build_metrics_config(), seed=4)
 
         metrics = engine.run()
-        global_summary = metrics.global_summary()
+        global_summary = metrics.global_summary(
+            pools=engine.pools,
+            total_time_ms=engine.current_time_ms,
+        )
 
         self.assertEqual(
             set(global_summary.keys()),
@@ -183,12 +230,18 @@ class MetricsSummaryTest(unittest.TestCase):
                 "system_tpot_avg_ms",
                 "prefill_first_token_latency_avg_ms",
                 "prefill_first_token_latency_max_ms",
-                "prefill_first_token_latency_p50_ms",
-                "prefill_first_token_latency_p95_ms",
                 "prefill_queue_avg_ms",
                 "prefill_queue_max_ms",
-                "req_queued_count",
-                "req_queued_ratio",
+                "prefill_queued_count",
+                "prefill_queued_ratio",
+                "short_prefill_queued_count",
+                "short_prefill_queued_ratio",
+                "long_prefill_queued_count",
+                "long_prefill_queued_ratio",
+                "short_prefill_utilization",
+                "long_prefill_utilization",
+                "decode_utilization",
+                "simulation_total_time_ms",
                 "request_throughput_rps",
                 "output_token_throughput_tps",
                 "decode_token_throughput_tps",
@@ -198,6 +251,39 @@ class MetricsSummaryTest(unittest.TestCase):
         self.assertEqual(
             global_summary["request_tpot_avg_ms"],
             metrics.summary()["request_tpot_avg_ms"],
+        )
+        short_instances = [
+            instance
+            for pool in engine.pools.values()
+            if pool.kind == ResourceKind.SHORT_PREFILL
+            for instance in pool.instances
+        ]
+        decode_instances = [
+            instance
+            for pool in engine.pools.values()
+            if pool.kind == ResourceKind.DECODE
+            for instance in pool.instances
+        ]
+        self.assertAlmostEqual(
+            global_summary["short_prefill_utilization"] or 0.0,
+            sum(instance.total_busy_time_ms for instance in short_instances)
+            / (len(short_instances) * engine.current_time_ms),
+        )
+        self.assertAlmostEqual(
+            global_summary["decode_utilization"] or 0.0,
+            sum(instance.total_busy_time_ms for instance in decode_instances)
+            / (len(decode_instances) * engine.current_time_ms),
+        )
+        long_instances = [
+            instance
+            for pool in engine.pools.values()
+            if pool.kind == ResourceKind.LONG_PREFILL
+            for instance in pool.instances
+        ]
+        self.assertAlmostEqual(
+            global_summary["long_prefill_utilization"] or 0.0,
+            sum(instance.total_busy_time_ms for instance in long_instances)
+            / (len(long_instances) * engine.current_time_ms),
         )
 
 

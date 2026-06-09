@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from .config import ResourceKind
 from .models import Request, ResourcePool
 
 
@@ -64,11 +65,23 @@ class SimulationMetrics:
         total_output_tokens = 0
         total_decode_tokens = 0
         total_prompt_tokens = 0
+        short_prefill_total_requests = 0
+        long_prefill_total_requests = 0
+        short_prefill_queued_count = 0
+        long_prefill_queued_count = 0
         min_arrival_time_ms: float | None = None
         max_finish_time_ms = 0.0
 
         for request in self.request_records:
             session_ids.add(request.session_id)
+            if request.target_prefill_kind == ResourceKind.SHORT_PREFILL:
+                short_prefill_total_requests += 1
+                if request.queue_time_prefill_ms > 0.0:
+                    short_prefill_queued_count += 1
+            elif request.target_prefill_kind == ResourceKind.LONG_PREFILL:
+                long_prefill_total_requests += 1
+                if request.queue_time_prefill_ms > 0.0:
+                    long_prefill_queued_count += 1
             finish_time_ms = request.finish_time_ms
             if not finish_time_ms:
                 continue
@@ -130,7 +143,7 @@ class SimulationMetrics:
         prefill_queue_max_ms = (
             max(prefill_queue_values) if prefill_queue_values else None
         )
-        req_queued_count = sum(1 for value in prefill_queue_values if value > 0.0)
+        prefill_queued_count = sum(1 for value in prefill_queue_values if value > 0.0)
         tpot_le_50ms_count = sum(1 for value in request_tpot_values if value <= 50.0)
         ttft_le_2s_count = sum(
             1 for value in prefill_first_token_values if value <= 2000.0
@@ -177,10 +190,32 @@ class SimulationMetrics:
             "prefill_first_token_latency_max_ms": prefill_first_token_latency_max_ms,
             "prefill_queue_avg_ms": prefill_queue_avg_ms,
             "prefill_queue_max_ms": prefill_queue_max_ms,
-            "req_queued_count": req_queued_count,
-            "req_queued_ratio": (
-                req_queued_count / len(completed) if completed else None
+            "prefill_queued_count": prefill_queued_count,
+            "prefill_queued_ratio": (
+                prefill_queued_count / len(self.request_records)
+                if self.request_records
+                else None
             ),
+            "short_prefill_queued_count": short_prefill_queued_count,
+            "short_prefill_queued_ratio": (
+                short_prefill_queued_count / short_prefill_total_requests
+                if short_prefill_total_requests
+                else None
+            ),
+            "long_prefill_queued_count": long_prefill_queued_count,
+            "long_prefill_queued_ratio": (
+                long_prefill_queued_count / long_prefill_total_requests
+                if long_prefill_total_requests
+                else None
+            ),
+            # Backward-compatible aliases for older generic prefill queue names.
+            "req_queued_count": prefill_queued_count,
+            "req_queued_ratio": (
+                prefill_queued_count / len(self.request_records)
+                if self.request_records
+                else None
+            ),
+            "simulation_total_time_ms": max_finish_time_ms if completed else None,
             "active_window_ms": active_window_ms if completed else None,
             "request_throughput_rps": (
                 len(completed) / active_window_s if active_window_s else None
@@ -208,8 +243,25 @@ class SimulationMetrics:
             ),
         }
 
-    def global_summary(self) -> dict[str, float | int | None]:
+    def global_summary(
+        self,
+        pools: dict[str, ResourcePool] | None = None,
+        total_time_ms: float | None = None,
+    ) -> dict[str, float | int | None]:
         summary = self.summary()
+        short_prefill_utilization = None
+        long_prefill_utilization = None
+        decode_utilization = None
+        if pools is not None and total_time_ms and total_time_ms > 0:
+            short_prefill_utilization = self._resource_kind_utilization(
+                pools, ResourceKind.SHORT_PREFILL, total_time_ms
+            )
+            long_prefill_utilization = self._resource_kind_utilization(
+                pools, ResourceKind.LONG_PREFILL, total_time_ms
+            )
+            decode_utilization = self._resource_kind_utilization(
+                pools, ResourceKind.DECODE, total_time_ms
+            )
         return {
             "request_tpot_avg_ms": summary["request_tpot_avg_ms"],
             "system_tpot_avg_ms": summary["system_tpot_avg_ms"],
@@ -219,21 +271,40 @@ class SimulationMetrics:
             "prefill_first_token_latency_max_ms": summary[
                 "prefill_first_token_latency_max_ms"
             ],
-            "prefill_first_token_latency_p50_ms": summary[
-                "prefill_first_token_latency_p50_ms"
-            ],
-            "prefill_first_token_latency_p95_ms": summary[
-                "prefill_first_token_latency_p95_ms"
-            ],
             "prefill_queue_avg_ms": summary["prefill_queue_avg_ms"],
             "prefill_queue_max_ms": summary["prefill_queue_max_ms"],
-            "req_queued_count": summary["req_queued_count"],
-            "req_queued_ratio": summary["req_queued_ratio"],
+            "prefill_queued_count": summary["prefill_queued_count"],
+            "prefill_queued_ratio": summary["prefill_queued_ratio"],
+            "short_prefill_queued_count": summary["short_prefill_queued_count"],
+            "short_prefill_queued_ratio": summary["short_prefill_queued_ratio"],
+            "long_prefill_queued_count": summary["long_prefill_queued_count"],
+            "long_prefill_queued_ratio": summary["long_prefill_queued_ratio"],
+            "short_prefill_utilization": short_prefill_utilization,
+            "long_prefill_utilization": long_prefill_utilization,
+            "decode_utilization": decode_utilization,
+            "simulation_total_time_ms": summary["simulation_total_time_ms"],
             "request_throughput_rps": summary["request_throughput_rps"],
             "output_token_throughput_tps": summary["output_token_throughput_tps"],
             "decode_token_throughput_tps": summary["decode_token_throughput_tps"],
             "prefill_token_throughput_tps": summary["prefill_token_throughput_tps"],
         }
+
+    def _resource_kind_utilization(
+        self,
+        pools: dict[str, ResourcePool],
+        kind: ResourceKind,
+        total_time_ms: float,
+    ) -> float | None:
+        instances = [
+            instance
+            for pool in pools.values()
+            if pool.kind == kind
+            for instance in pool.instances
+        ]
+        if not instances:
+            return None
+        total_busy_time_ms = sum(instance.total_busy_time_ms for instance in instances)
+        return total_busy_time_ms / (len(instances) * total_time_ms)
 
     def request_breakdown(self, limit: int | None = None) -> list[dict[str, object]]:
         records = self.request_records if limit is None else self.request_records[:limit]
@@ -250,6 +321,11 @@ class SimulationMetrics:
                 "prompt_tokens": request.prompt_tokens,
                 "output_tokens": request.output_tokens,
                 "prefill_pool_id": request.target_prefill_pool_id,
+                "prefill_kind": (
+                    request.target_prefill_kind.value
+                    if request.target_prefill_kind is not None
+                    else None
+                ),
                 "decode_pool_id": request.target_decode_pool_id,
                 "prefill_cluster_id": request.prefill_cluster_id,
                 "decode_cluster_id": request.decode_cluster_id,

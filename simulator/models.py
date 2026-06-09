@@ -32,6 +32,7 @@ class Request:
     new_prompt_tokens: int = 0
     stage: RequestStage = RequestStage.NEW
     target_prefill_pool_id: str | None = None
+    target_prefill_kind: ResourceKind | None = None
     target_decode_pool_id: str | None = None
     prefill_cluster_id: str | None = None
     decode_cluster_id: str | None = None
