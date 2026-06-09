@@ -84,11 +84,11 @@ class SchedulerConfig:
 
 @dataclass
 class PerformanceConfig:
-    short_prefill_ms_per_token: float = 0.1
-    long_prefill_ms_per_token: float = 0.14
-    prefill_batch_size_penalty: float = 0.02
-    decode_base_step_ms: float = 8.0
-    decode_batch_size_slope_ms: float = 1.5
+    short_prefill_ms_per_token: float = 0.05
+    long_prefill_ms_per_token: float = 0.025
+    prefill_batch_size_penalty: float = 0.0
+    decode_base_step_ms: float = 20.0
+    decode_batch_size_slope_ms: float = 0.0122
 
 
 @dataclass

@@ -122,6 +122,15 @@ class SimulationMetrics:
         prefill_first_token_latency_max_ms = (
             max(prefill_first_token_values) if prefill_first_token_values else None
         )
+        prefill_queue_avg_ms = (
+            sum(prefill_queue_values) / len(prefill_queue_values)
+            if prefill_queue_values
+            else None
+        )
+        prefill_queue_max_ms = (
+            max(prefill_queue_values) if prefill_queue_values else None
+        )
+        req_queued_count = sum(1 for value in prefill_queue_values if value > 0.0)
         tpot_le_50ms_count = sum(1 for value in request_tpot_values if value <= 50.0)
         ttft_le_2s_count = sum(
             1 for value in prefill_first_token_values if value <= 2000.0
@@ -166,6 +175,12 @@ class SimulationMetrics:
             "system_tpot_avg_ms": system_tpot_avg_ms,
             "prefill_first_token_latency_avg_ms": prefill_first_token_latency_avg_ms,
             "prefill_first_token_latency_max_ms": prefill_first_token_latency_max_ms,
+            "prefill_queue_avg_ms": prefill_queue_avg_ms,
+            "prefill_queue_max_ms": prefill_queue_max_ms,
+            "req_queued_count": req_queued_count,
+            "req_queued_ratio": (
+                req_queued_count / len(completed) if completed else None
+            ),
             "active_window_ms": active_window_ms if completed else None,
             "request_throughput_rps": (
                 len(completed) / active_window_s if active_window_s else None
@@ -210,6 +225,10 @@ class SimulationMetrics:
             "prefill_first_token_latency_p95_ms": summary[
                 "prefill_first_token_latency_p95_ms"
             ],
+            "prefill_queue_avg_ms": summary["prefill_queue_avg_ms"],
+            "prefill_queue_max_ms": summary["prefill_queue_max_ms"],
+            "req_queued_count": summary["req_queued_count"],
+            "req_queued_ratio": summary["req_queued_ratio"],
             "request_throughput_rps": summary["request_throughput_rps"],
             "output_token_throughput_tps": summary["output_token_throughput_tps"],
             "decode_token_throughput_tps": summary["decode_token_throughput_tps"],

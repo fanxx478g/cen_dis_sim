@@ -80,6 +80,7 @@ class MetricsSummaryTest(unittest.TestCase):
         total_output_tokens = sum(request.output_tokens for request in completed)
         total_decode_tokens = sum(max(request.output_tokens - 1, 0) for request in completed)
         total_prompt_tokens = sum(request.prompt_tokens for request in completed)
+        prefill_queue_values = [request.queue_time_prefill_ms for request in completed]
 
         self.assertIn("prefill_first_token_latency_p50_ms", summary)
         self.assertIn("system_tpot_avg_ms", summary)
@@ -110,6 +111,22 @@ class MetricsSummaryTest(unittest.TestCase):
         self.assertAlmostEqual(
             summary["prefill_token_throughput_tps"] or 0.0,
             total_prompt_tokens / active_window_s,
+        )
+        self.assertAlmostEqual(
+            summary["prefill_queue_avg_ms"] or 0.0,
+            sum(prefill_queue_values) / len(prefill_queue_values),
+        )
+        self.assertAlmostEqual(
+            summary["prefill_queue_max_ms"] or 0.0,
+            max(prefill_queue_values),
+        )
+        self.assertEqual(
+            summary["req_queued_count"],
+            sum(1 for value in prefill_queue_values if value > 0.0),
+        )
+        self.assertAlmostEqual(
+            summary["req_queued_ratio"] or 0.0,
+            sum(1 for value in prefill_queue_values if value > 0.0) / len(completed),
         )
         self.assertEqual(
             summary["requests_with_tpot_le_50ms"],
@@ -168,6 +185,10 @@ class MetricsSummaryTest(unittest.TestCase):
                 "prefill_first_token_latency_max_ms",
                 "prefill_first_token_latency_p50_ms",
                 "prefill_first_token_latency_p95_ms",
+                "prefill_queue_avg_ms",
+                "prefill_queue_max_ms",
+                "req_queued_count",
+                "req_queued_ratio",
                 "request_throughput_rps",
                 "output_token_throughput_tps",
                 "decode_token_throughput_tps",

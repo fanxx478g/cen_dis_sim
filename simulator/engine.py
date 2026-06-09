@@ -539,8 +539,7 @@ class SimulationEngine:
             if kind == ResourceKind.LONG_PREFILL
             else perf.short_prefill_ms_per_token
         )
-        batch_penalty = 1.0 + perf.prefill_batch_size_penalty * max(batch_size - 1, 0)
-        return total_prompt_tokens * coeff * batch_penalty
+        return total_prompt_tokens * coeff
 
     def _drain_system(self) -> None:
         while (
