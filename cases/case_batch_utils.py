@@ -48,6 +48,8 @@ def abbreviate_scenario_label(scenario_label: str) -> str:
     mapping = {
         "distributed_2_clusters": "d2",
         "centralized_long_prefill_2_clusters": "c2",
+        "distributed_5_clusters_dis_first": "d5_df",
+        "centralized_short_prefill_5_clusters_dis_first": "c5_df",
     }
     return mapping.get(scenario_label, sanitize_tag(scenario_label))
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 from pprint import pformat
@@ -13,19 +14,35 @@ from cases.case_batch_utils import (
 )
 
 
-def build_summary_csv_path() -> str:
-    return os.path.join(ensure_case_log_dir(), "log_summary.csv")
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Summarize batch log files into a CSV table."
+    )
+    parser.add_argument(
+        "--log-dir",
+        default=None,
+        help=(
+            "Optional log directory to scan. Defaults to cases/log."
+        ),
+    )
+    return parser.parse_args()
+
+
+def build_summary_csv_path(log_dir: str) -> str:
+    return os.path.join(log_dir, "log_summary.csv")
 
 
 def main() -> None:
-    rows = collect_batch_log_rows()
+    args = parse_args()
+    log_dir = args.log_dir or ensure_case_log_dir()
+    rows = collect_batch_log_rows(log_dir)
     if not rows:
-        print("No parsable batch logs found under cases/log.", flush=True)
+        print(f"No parsable batch logs found under {log_dir}.", flush=True)
         return
 
     output_file_path = export_batch_log_summary_csv(
         rows,
-        output_file_path=build_summary_csv_path(),
+        output_file_path=build_summary_csv_path(log_dir),
     )
 
     print("=== Log Summary Ready ===", flush=True)

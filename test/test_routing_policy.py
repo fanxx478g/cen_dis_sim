@@ -16,6 +16,7 @@ from simulator import (
     register_policy,
 )
 from simulator.policies.base import PolicyContext
+from simulator.models import Request
 
 
 def build_single_request_config(
@@ -71,6 +72,26 @@ def build_single_request_config(
 
 
 class RoutingPolicyTest(unittest.TestCase):
+    def _select_prefill_pool_for_request(
+        self,
+        config: SimulationConfig,
+        *,
+        prompt_tokens: int,
+        seed: int = 7,
+    ):
+        engine = SimulationEngine(config=config, seed=seed)
+        request = Request(
+            request_id=1,
+            arrival_time_ms=0.0,
+            prompt_tokens=prompt_tokens,
+            output_tokens=1,
+        )
+        prefill_kind = engine.scheduler._prefill_kind_for_request(request)
+        return engine, engine.scheduler.select_prefill_pool(
+            request,
+            engine.prefill_pools_by_kind[prefill_kind],
+        )
+
     def test_prefill_routes_only_to_matching_resource_kind(self) -> None:
         short_engine = SimulationEngine(
             config=build_single_request_config(prompt_tokens=4096),
@@ -120,6 +141,45 @@ class RoutingPolicyTest(unittest.TestCase):
         request = SimulationEngine(config=config, seed=9).run().request_records[0]
 
         self.assertEqual(request.target_decode_pool_id, "edge-b-decode")
+
+    def test_default_policy_short_prefill_still_uses_all_cluster_weights_including_central(self) -> None:
+        config = build_single_request_config(
+            prompt_tokens=4096,
+            scheduler=SchedulerConfig(
+                policy_name="p_default",
+                allow_first_decode_cross_cluster=False,
+                allow_following_decode_cross_cluster=False,
+                prompt_len_threshold=16 * 1024,
+                policy_config={
+                    "cluster_routing_weights": {
+                        "central": {"short_prefill": 1.0},
+                        "edge-a": {"short_prefill": 0.0},
+                        "edge-b": {"short_prefill": 0.0},
+                    }
+                },
+            ),
+            clusters=[
+                cluster(
+                    "central",
+                    pools=[pool("central-short-prefill", ResourceKind.SHORT_PREFILL, 1, 1)],
+                ),
+                cluster(
+                    "edge-a",
+                    pools=[pool("edge-a-short-prefill", ResourceKind.SHORT_PREFILL, 1, 1)],
+                ),
+                cluster(
+                    "edge-b",
+                    pools=[pool("edge-b-short-prefill", ResourceKind.SHORT_PREFILL, 1, 1)],
+                ),
+            ],
+        )
+
+        _, selected_pool = self._select_prefill_pool_for_request(
+            config,
+            prompt_tokens=4096,
+        )
+
+        self.assertEqual(selected_pool.pool_id, "central-short-prefill")
 
     def test_first_decode_cross_cluster_flag_prefers_same_cluster_decode(self) -> None:
         config = build_single_request_config(
@@ -285,6 +345,287 @@ class RoutingPolicyTest(unittest.TestCase):
         request = SimulationEngine(config=config, seed=2).run().request_records[0]
 
         self.assertEqual(request.target_decode_pool_id, "edge-b-decode")
+
+    def test_dis_first_short_prefill_prefers_sampled_distributed_pool_when_queue_is_light(self) -> None:
+        config = build_single_request_config(
+            prompt_tokens=4096,
+            scheduler=SchedulerConfig(
+                policy_name="dis_first",
+                allow_first_decode_cross_cluster=False,
+                allow_following_decode_cross_cluster=False,
+                prompt_len_threshold=16 * 1024,
+                policy_config={
+                    "cluster_routing_weights": {
+                        "central": {"short_prefill": 999.0},
+                    },
+                    "distributed_cluster_routing_weights": {
+                        "edge-a": {"short_prefill": 1.0},
+                        "edge-b": {"short_prefill": 0.0},
+                    },
+                    "short_prefill_queue_threshold": 0,
+                },
+            ),
+            clusters=[
+                cluster(
+                    "central",
+                    pools=[
+                        pool("central-short-prefill", ResourceKind.SHORT_PREFILL, 1, 1),
+                        pool("central-decode", ResourceKind.DECODE, 1, 1),
+                    ],
+                ),
+                cluster(
+                    "edge-a",
+                    pools=[pool("edge-a-short-prefill", ResourceKind.SHORT_PREFILL, 1, 1)],
+                ),
+                cluster(
+                    "edge-b",
+                    pools=[pool("edge-b-short-prefill", ResourceKind.SHORT_PREFILL, 1, 1)],
+                ),
+            ],
+        )
+        config.scenario.central_cluster_id = "central"
+
+        _, selected_pool = self._select_prefill_pool_for_request(
+            config,
+            prompt_tokens=4096,
+        )
+
+        self.assertEqual(selected_pool.pool_id, "edge-a-short-prefill")
+
+    def test_dis_first_short_prefill_never_samples_central_cluster_in_first_step(self) -> None:
+        config = build_single_request_config(
+            prompt_tokens=4096,
+            scheduler=SchedulerConfig(
+                policy_name="dis_first",
+                allow_first_decode_cross_cluster=False,
+                allow_following_decode_cross_cluster=False,
+                prompt_len_threshold=16 * 1024,
+                policy_config={
+                    "cluster_routing_weights": {
+                        "central": {"short_prefill": 999.0},
+                    },
+                    "distributed_cluster_routing_weights": {
+                        "edge-a": {"short_prefill": 0.0},
+                        "edge-b": {"short_prefill": 1.0},
+                    },
+                    "short_prefill_queue_threshold": 0,
+                },
+            ),
+            clusters=[
+                cluster(
+                    "central",
+                    pools=[pool("central-short-prefill", ResourceKind.SHORT_PREFILL, 1, 1)],
+                ),
+                cluster(
+                    "edge-a",
+                    pools=[pool("edge-a-short-prefill", ResourceKind.SHORT_PREFILL, 1, 1)],
+                ),
+                cluster(
+                    "edge-b",
+                    pools=[pool("edge-b-short-prefill", ResourceKind.SHORT_PREFILL, 1, 1)],
+                ),
+            ],
+        )
+        config.scenario.central_cluster_id = "central"
+
+        _, selected_pool = self._select_prefill_pool_for_request(
+            config,
+            prompt_tokens=4096,
+        )
+
+        self.assertEqual(selected_pool.pool_id, "edge-b-short-prefill")
+
+    def test_dis_first_short_prefill_falls_back_to_pure_distributed_selection_without_central_cluster(self) -> None:
+        config = build_single_request_config(
+            prompt_tokens=4096,
+            scheduler=SchedulerConfig(
+                policy_name="dis_first",
+                allow_first_decode_cross_cluster=False,
+                allow_following_decode_cross_cluster=False,
+                prompt_len_threshold=16 * 1024,
+                policy_config={
+                    "distributed_cluster_routing_weights": {
+                        "edge-a": {"short_prefill": 0.0},
+                        "edge-b": {"short_prefill": 1.0},
+                    },
+                    "short_prefill_queue_threshold": 0,
+                },
+            ),
+            clusters=[
+                cluster(
+                    "edge-a",
+                    pools=[pool("edge-a-short-prefill", ResourceKind.SHORT_PREFILL, 1, 1)],
+                ),
+                cluster(
+                    "edge-b",
+                    pools=[pool("edge-b-short-prefill", ResourceKind.SHORT_PREFILL, 1, 1)],
+                ),
+            ],
+        )
+
+        _, selected_pool = self._select_prefill_pool_for_request(
+            config,
+            prompt_tokens=4096,
+        )
+
+        self.assertEqual(selected_pool.pool_id, "edge-b-short-prefill")
+
+    def test_dis_first_short_prefill_falls_back_to_central_when_distributed_is_queued(self) -> None:
+        config = build_single_request_config(
+            prompt_tokens=4096,
+            scheduler=SchedulerConfig(
+                policy_name="dis_first",
+                allow_first_decode_cross_cluster=False,
+                allow_following_decode_cross_cluster=False,
+                prompt_len_threshold=16 * 1024,
+                policy_config={
+                    "distributed_cluster_routing_weights": {
+                        "edge-a": {"short_prefill": 1.0},
+                    },
+                    "short_prefill_queue_threshold": 0,
+                },
+            ),
+            clusters=[
+                cluster(
+                    "central",
+                    pools=[
+                        pool("central-short-prefill", ResourceKind.SHORT_PREFILL, 1, 1),
+                        pool("central-decode", ResourceKind.DECODE, 1, 1),
+                    ],
+                ),
+                cluster(
+                    "edge-a",
+                    pools=[pool("edge-a-short-prefill", ResourceKind.SHORT_PREFILL, 1, 1)],
+                ),
+            ],
+        )
+        config.scenario.central_cluster_id = "central"
+
+        engine, _ = self._select_prefill_pool_for_request(
+            config,
+            prompt_tokens=4096,
+        )
+        distributed_pool = engine.pools["edge-a-short-prefill"]
+        busy_instance = distributed_pool.acquire_idle_instance()
+        self.assertIsNotNone(busy_instance)
+        distributed_pool.extend_waiting_request_ids([9001])
+        request = Request(
+            request_id=1,
+            arrival_time_ms=0.0,
+            prompt_tokens=4096,
+            output_tokens=1,
+        )
+        selected_pool = engine.scheduler.select_prefill_pool(
+            request,
+            engine.prefill_pools_by_kind[ResourceKind.SHORT_PREFILL],
+        )
+
+        self.assertEqual(selected_pool.pool_id, "central-short-prefill")
+
+    def test_dis_first_short_prefill_stays_distributed_when_both_distributed_and_central_are_queued(self) -> None:
+        config = build_single_request_config(
+            prompt_tokens=4096,
+            scheduler=SchedulerConfig(
+                policy_name="dis_first",
+                allow_first_decode_cross_cluster=False,
+                allow_following_decode_cross_cluster=False,
+                prompt_len_threshold=16 * 1024,
+                policy_config={
+                    "distributed_cluster_routing_weights": {
+                        "edge-a": {"short_prefill": 1.0},
+                    },
+                    "short_prefill_queue_threshold": 0,
+                },
+            ),
+            clusters=[
+                cluster(
+                    "central",
+                    pools=[
+                        pool("central-short-prefill", ResourceKind.SHORT_PREFILL, 1, 1),
+                        pool("central-decode", ResourceKind.DECODE, 1, 1),
+                    ],
+                ),
+                cluster(
+                    "edge-a",
+                    pools=[pool("edge-a-short-prefill", ResourceKind.SHORT_PREFILL, 1, 1)],
+                ),
+            ],
+        )
+        config.scenario.central_cluster_id = "central"
+
+        engine, _ = self._select_prefill_pool_for_request(
+            config,
+            prompt_tokens=4096,
+        )
+        central_pool = engine.pools["central-short-prefill"]
+        distributed_pool = engine.pools["edge-a-short-prefill"]
+        self.assertIsNotNone(central_pool.acquire_idle_instance())
+        self.assertIsNotNone(distributed_pool.acquire_idle_instance())
+        central_pool.extend_waiting_request_ids([8001])
+        distributed_pool.extend_waiting_request_ids([9001])
+        request = Request(
+            request_id=1,
+            arrival_time_ms=0.0,
+            prompt_tokens=4096,
+            output_tokens=1,
+        )
+        selected_pool = engine.scheduler.select_prefill_pool(
+            request,
+            engine.prefill_pools_by_kind[ResourceKind.SHORT_PREFILL],
+        )
+
+        self.assertEqual(selected_pool.pool_id, "edge-a-short-prefill")
+
+    def test_dis_first_short_prefill_queue_threshold_x_is_configurable(self) -> None:
+        config = build_single_request_config(
+            prompt_tokens=4096,
+            scheduler=SchedulerConfig(
+                policy_name="dis_first",
+                allow_first_decode_cross_cluster=False,
+                allow_following_decode_cross_cluster=False,
+                prompt_len_threshold=16 * 1024,
+                policy_config={
+                    "distributed_cluster_routing_weights": {
+                        "edge-a": {"short_prefill": 1.0},
+                    },
+                    "short_prefill_queue_threshold": 1,
+                },
+            ),
+            clusters=[
+                cluster(
+                    "central",
+                    pools=[
+                        pool("central-short-prefill", ResourceKind.SHORT_PREFILL, 1, 1),
+                        pool("central-decode", ResourceKind.DECODE, 1, 1),
+                    ],
+                ),
+                cluster(
+                    "edge-a",
+                    pools=[pool("edge-a-short-prefill", ResourceKind.SHORT_PREFILL, 1, 1)],
+                ),
+            ],
+        )
+        config.scenario.central_cluster_id = "central"
+
+        engine, _ = self._select_prefill_pool_for_request(
+            config,
+            prompt_tokens=4096,
+        )
+        distributed_pool = engine.pools["edge-a-short-prefill"]
+        self.assertIsNotNone(distributed_pool.acquire_idle_instance())
+        distributed_pool.extend_waiting_request_ids([9001])
+        request = Request(
+            request_id=1,
+            arrival_time_ms=0.0,
+            prompt_tokens=4096,
+            output_tokens=1,
+        )
+        selected_pool = engine.scheduler.select_prefill_pool(
+            request,
+            engine.prefill_pools_by_kind[ResourceKind.SHORT_PREFILL],
+        )
+
+        self.assertEqual(selected_pool.pool_id, "edge-a-short-prefill")
 
 
 if __name__ == "__main__":
