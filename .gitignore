@@ -10,6 +10,8 @@ venv/
 env/
 
 cases/log/
+long_prefill_sim/outputs/
+short_prefill_sim/outputs/
 
 .DS_Store
 Thumbs.db
